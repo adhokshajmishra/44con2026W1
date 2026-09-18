@@ -125,7 +125,11 @@ std::vector<std::string> read_proc_cmdlines() {
 }
 
 bool matches_agent_pattern(const std::string& text) {
-  // TOOD: check for known names
+  static const char* patterns[] = {"aliyun", "aegis",     "qcloud", "tencent", "bmc-agent",
+                                   "falco",  "sentinel",  "crowd",  "elastic-agent"};
+  for (const char* p : patterns) {
+    if (text.find(p) != std::string::npos) return true;
+  }
   return false;
 }
 
