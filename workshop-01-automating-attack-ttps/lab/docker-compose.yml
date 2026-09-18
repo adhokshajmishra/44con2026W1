@@ -1,0 +1,123 @@
+# Intentionally vulnerable TeamTNT-style lab targets — TRAINING ONLY
+# Isolated network; do not expose 2375 outside localhost.
+
+services:
+  # Misconfigured Docker API (TeamTNT T1133 / T1595.002)
+  docker-api:
+    image: docker:27-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command:
+      - dockerd
+      - --host=tcp://0.0.0.0:2375
+      - --host=unix:///var/run/docker.sock
+      - --iptables=false
+    ports:
+      - "2375:2375"
+    networks:
+      - teamtnt-lab
+    volumes:
+      - docker-api-data:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # Seeds victim container inside docker-api (dind) for API-based harvest
+  bootstrap:
+    build:
+      context: ./targets/bootstrap
+    environment:
+      DIND_HOST: tcp://docker-api:2375
+      VICTIM_IMAGE: lab-victim-app
+    depends_on:
+      docker-api:
+        condition: service_healthy
+      victim-app:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - teamtnt-lab
+    restart: "no"
+
+  # Standalone victim for host-level browsing (optional decoy)
+  victim-app:
+    build:
+      context: ./targets
+      dockerfile: victim-app/Dockerfile
+    ports:
+      - "8080:80"
+    networks:
+      - teamtnt-lab
+
+  # SSH lateral movement target (T1021.004 — key + password auth)
+  lateral-ssh-target:
+    build:
+      context: ./targets
+      dockerfile: lateral-ssh-target/Dockerfile
+    hostname: lateral-ssh-target
+    networks:
+      - teamtnt-lab
+
+  # IMDSv1-style metadata server (T1552.005)
+  metadata-sim:
+    build:
+      context: ./targets/metadata-sim
+    hostname: metadata-sim
+    ports:
+      - "8180:80"
+    networks:
+      - teamtnt-lab
+
+  # Attacker workstation with scanning tools pre-installed
+  attacker:
+    build:
+      context: ./targets/attacker
+    depends_on:
+      docker-api:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+      metadata-sim:
+        condition: service_started
+      lateral-ssh-target:
+        condition: service_started
+    networks:
+      - teamtnt-lab
+    volumes:
+      - ../scripts:/opt/teamtnt/scripts:ro
+      - ../config:/opt/teamtnt/config:ro
+      - ../native_automation:/opt/teamtnt/native_automation
+      - ../../workshop-02-defense-evasion-red-team/native_automation:/opt/teamtnt/evasion/native_automation
+      - ../../workshop-02-defense-evasion-red-team/lib:/opt/teamtnt/evasion/lib:ro
+      - ../../workshop-02-defense-evasion-red-team/scripts:/opt/teamtnt/evasion/scripts:ro
+      - attack-staging:/tmp/teamtnt-staging
+      - evasion-staging:/tmp/teamtnt-evasion
+    stdin_open: true
+    tty: true
+    command:
+      - bash
+      - -lc
+      - |
+        echo 'Attacker ready.'
+        echo '  WS1 shell:   /opt/teamtnt/scripts/teamtnt-chain.sh'
+        echo '  WS1 native:  /opt/teamtnt/native_automation/build-docker/teamtnt_native'
+        echo '  WS2 shell:   /opt/teamtnt/evasion/scripts/evasion-chain.sh'
+        echo '  WS2 native:  /opt/teamtnt/evasion/native_automation/build-docker/evasion_native'
+        exec bash
+
+networks:
+  teamtnt-lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  docker-api-data:
+  attack-staging:
+  evasion-staging:
